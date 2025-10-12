@@ -4,6 +4,8 @@ import numpy as np
 from datetime import datetime
 import plotly.express as px
 from statsmodels.tsa.holtwinters import ExponentialSmoothing
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.metrics import mean_absolute_error, mean_squared_error
 
 st.set_page_config(page_title="Varejo & Distribuição – KPI & Forecast", layout="wide")
 
@@ -187,6 +189,141 @@ if len(serie_cat.dropna()) > 20:
         st.caption(f"MAPE (backtest {back_n} semanas): {mape:,.1f}%")
 else:
     st.info("Dados insuficientes para previsão semanal desta categoria. Selecione outra ou amplie o período.")
+
+st.subheader("Módulo de Machine Learning – Previsão diária por loja/canal/categoria")
+col_ml1, col_ml2, col_ml3 = st.columns(3)
+with col_ml1:
+    loja_ml = st.selectbox("Loja (ML)", options=sorted(df["loja"].unique()))
+with col_ml2:
+    canal_ml = st.selectbox("Canal (ML)", options=sorted(df["canal"].unique()))
+with col_ml3:
+    categoria_ml = st.selectbox("Categoria (ML)", options=sorted(df["categoria"].unique()))
+
+col_ml4, col_ml5 = st.columns(2)
+with col_ml4:
+    horizonte_ml = st.slider("Horizonte (dias à frente)", 7, 30, 14)
+with col_ml5:
+    promo_ml = st.slider("Premissa de promoções futuras (%)", 0, 40, 12, step=1) / 100
+
+mask_ml = (
+    (df["loja"] == loja_ml) &
+    (df["canal"] == canal_ml) &
+    (df["categoria"] == categoria_ml)
+)
+
+serie_ml = (df.loc[mask_ml]
+              .groupby("data")
+              .agg(vendas=("vendas", "sum"), promo_rate=("promo", "mean"))
+              .reset_index()
+              .sort_values("data"))
+
+if not serie_ml.empty:
+    serie_ml["promo_rate"] = serie_ml["promo_rate"].fillna(0.0)
+    serie_ml["dow"] = serie_ml["data"].dt.dayofweek
+    serie_ml["month"] = serie_ml["data"].dt.month
+    serie_ml["is_weekend"] = serie_ml["dow"].isin([5, 6]).astype(int)
+    serie_ml["trend"] = np.arange(len(serie_ml))
+    serie_ml["lag_1"] = serie_ml["vendas"].shift(1)
+    serie_ml["lag_7"] = serie_ml["vendas"].shift(7)
+    serie_ml["ma_7"] = serie_ml["vendas"].shift(1).rolling(7).mean()
+
+    feature_cols = ["dow", "month", "is_weekend", "trend", "promo_rate", "lag_1", "lag_7", "ma_7"]
+    treino_ml = serie_ml.dropna(subset=feature_cols + ["vendas"]).reset_index(drop=True)
+
+    if len(treino_ml) > 30:
+        split_idx = int(len(treino_ml) * 0.8)
+        treino_df = treino_ml.iloc[:split_idx]
+        teste_df = treino_ml.iloc[split_idx:]
+
+        modelo_treino = RandomForestRegressor(n_estimators=400, random_state=42)
+        modelo_treino.fit(treino_df[feature_cols], treino_df["vendas"])
+
+        if not teste_df.empty:
+            preds_teste = modelo_treino.predict(teste_df[feature_cols])
+            mae = mean_absolute_error(teste_df["vendas"], preds_teste)
+            rmse = mean_squared_error(teste_df["vendas"], preds_teste, squared=False)
+            with np.errstate(divide='ignore', invalid='ignore'):
+                mape_vals = np.where(teste_df["vendas"] != 0,
+                                     np.abs((teste_df["vendas"] - preds_teste) / teste_df["vendas"]),
+                                     np.nan)
+            mape_ml = np.nanmean(mape_vals) * 100
+        else:
+            mae = rmse = mape_ml = np.nan
+
+        modelo = RandomForestRegressor(n_estimators=400, random_state=42)
+        modelo.fit(treino_ml[feature_cols], treino_ml["vendas"])
+
+        historico_plot = treino_ml[["data", "vendas"]].copy()
+        historico_plot["tipo"] = "Histórico"
+
+        historico_iter = treino_ml.copy()
+        previsoes = []
+
+        for passo in range(horizonte_ml):
+            prox_data = historico_iter["data"].iloc[-1] + pd.Timedelta(days=1)
+            dow = prox_data.dayofweek
+            month = prox_data.month
+            is_weekend = int(dow >= 5)
+            prox_trend = historico_iter["trend"].iloc[-1] + 1
+            lag_1 = historico_iter["vendas"].iloc[-1]
+            if len(historico_iter) >= 7:
+                lag_7 = historico_iter["vendas"].iloc[-7]
+            else:
+                lag_7 = lag_1
+            ma_7 = historico_iter["vendas"].tail(7).mean()
+
+            features_row = pd.DataFrame([{ 
+                "dow": dow,
+                "month": month,
+                "is_weekend": is_weekend,
+                "trend": prox_trend,
+                "promo_rate": promo_ml,
+                "lag_1": lag_1,
+                "lag_7": lag_7,
+                "ma_7": ma_7
+            }])
+
+            prev_val = float(modelo.predict(features_row[feature_cols])[0])
+            previsoes.append({"data": prox_data, "previsao": prev_val})
+
+            novo_registro = {
+                "data": prox_data,
+                "vendas": prev_val,
+                "promo_rate": promo_ml,
+                "dow": dow,
+                "month": month,
+                "is_weekend": is_weekend,
+                "trend": prox_trend,
+                "lag_1": lag_1,
+                "lag_7": lag_7,
+                "ma_7": ma_7
+            }
+            historico_iter = pd.concat([historico_iter, pd.DataFrame([novo_registro])], ignore_index=True)
+
+        if previsoes:
+            previsoes_df = pd.DataFrame(previsoes)
+            previsoes_df["tipo"] = "Previsão"
+            previsoes_df = previsoes_df.rename(columns={"previsao": "vendas"})
+
+            plot_ml = pd.concat([historico_plot, previsoes_df], ignore_index=True)
+            fig_ml = px.line(plot_ml, x="data", y="vendas", color="tipo", markers=True,
+                             title=f"Random Forest – {loja_ml} / {canal_ml} / {categoria_ml}")
+            st.plotly_chart(fig_ml, use_container_width=True)
+
+            col_met1, col_met2, col_met3 = st.columns(3)
+            col_met1.metric("MAE (R$)", f"{mae:,.0f}".replace(",", ".") if not np.isnan(mae) else "-")
+            col_met2.metric("RMSE (R$)", f"{rmse:,.0f}".replace(",", ".") if not np.isnan(rmse) else "-")
+            col_met3.metric("MAPE (%)", f"{mape_ml:,.1f}%".replace(",", ".") if not np.isnan(mape_ml) else "-")
+
+            tabela_prev = previsoes_df[["data", "vendas"]].copy()
+            tabela_prev["premissa_promo_%"] = promo_ml * 100
+            st.dataframe(tabela_prev.rename(columns={"vendas": "vendas_previstas"}))
+        else:
+            st.info("O modelo treinou, mas não foi possível gerar previsões futuras com os parâmetros atuais.")
+    else:
+        st.info("Dados históricos insuficientes para treinar o modelo de ML. Amplie o período ou escolha outra combinação.")
+else:
+    st.info("Não há histórico para a combinação selecionada.")
 
 st.divider()
 
