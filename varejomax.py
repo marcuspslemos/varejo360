@@ -1,9 +1,9 @@
- import streamlit as st
- import pandas as pd
- import numpy as np
- from datetime import datetime
- import plotly.express as px
- from sklearn.linear_model import LinearRegression
+import streamlit as st
+import pandas as pd
+import numpy as np
+from datetime import datetime
+import plotly.express as px
+from statsmodels.tsa.holtwinters import ExponentialSmoothing
  
  st.set_page_config(page_title="Varejo & Distribuição – KPI & Forecast", layout="wide")
  
